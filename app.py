@@ -1,185 +1,269 @@
-import streamlit as st
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
-import io
-import requests
-import re
-from collections import Counter
-from datetime import datetime
+"""
+gui_app.py
+-----------
+Interfata grafica (Tkinter - vine cu Python, nu necesita instalare separata)
+care leaga toate modulele:
 
-st.set_page_config(page_title="Vinted AI Studio & Market Pro", layout="wide", page_icon="✨")
+  1. Tab "Analiza piata" - introduci ce vinzi -> aplicatia cauta pe Vinted
+     articole similare, extrage tendinte si genereaza titlu + descriere.
+  2. Tab "Poze studio" - alegi poze -> aplicatia le proceseaza (luminozitate,
+     eliminare fundal, indreptare, fundal alb) si le salveaza intr-un folder.
 
-st.title("✨ Vinted AI Studio & Market Assistant")
-st.caption("Decupare AI de precizie, centrare proporțională de catalog & cercetare Vinted în timp real")
+Ruleaza cu:
+    python gui_app.py
+"""
 
-# --- PROCESARE FOTO AVANSATĂ CU AI REAL ---
-def remove_bg_with_ai(image_bytes, api_key=None):
-    """
-    Decupare profesională. Dacă ai un API key gratuit de la ClipDrop, îl folosește direct.
-    Dacă nu, folosește endpoint-ul public de înaltă precizie.
-    """
-    if api_key:
-        # Folosește ClipDrop API (Stability AI)
-        response = requests.post(
-            'https://clipdrop-api.co/remove-background/v1',
-            files={'image_file': ('image.png', image_bytes, 'image/png')},
-            headers={'x-api-key': api_key},
-            timeout=20
+from __future__ import annotations
+import os
+import threading
+import traceback
+from pathlib import Path
+from tkinter import (
+    Tk, StringVar, END, filedialog, messagebox, ttk, Text, BOTH, LEFT, RIGHT,
+    Y, X, TOP, BOTTOM, N, S, E, W, DISABLED, NORMAL
+)
+
+from vinted_scraper import get_market_trends, TrendReport
+from listing_generator import ItemInfo, generate_listing
+from image_studio import enhance_photo
+
+
+CONDITIONS = ["noua cu eticheta", "ca noua", "foarte buna", "buna", "satisfacatoare"]
+GENDERS = ["", "barbati", "femei", "unisex", "copii"]
+
+
+class VintedAssistantApp:
+    def __init__(self, root: Tk):
+        self.root = root
+        self.root.title("Asistent Vinted - analiza piata & poze studio")
+        self.root.geometry("880x640")
+
+        self.last_trends: TrendReport | None = None
+        self.selected_photos: list[str] = []
+
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        self.tab_listing = ttk.Frame(notebook)
+        self.tab_photos = ttk.Frame(notebook)
+        notebook.add(self.tab_listing, text="Analiza piata & Titlu/Descriere")
+        notebook.add(self.tab_photos, text="Poze studio")
+
+        self._build_listing_tab()
+        self._build_photos_tab()
+
+    # ------------------------------------------------------------------
+    # TAB 1: Analiza piata + generare titlu/descriere
+    # ------------------------------------------------------------------
+    def _build_listing_tab(self):
+        frame = self.tab_listing
+        pad = {"padx": 8, "pady": 4}
+
+        form = ttk.Frame(frame)
+        form.pack(fill=X, **pad)
+
+        self.var_category = StringVar()
+        self.var_brand = StringVar()
+        self.var_color = StringVar()
+        self.var_size = StringVar()
+        self.var_material = StringVar()
+        self.var_condition = StringVar(value=CONDITIONS[2])
+        self.var_gender = StringVar(value="")
+
+        def add_row(label, widget, row):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky=W, **pad)
+            widget.grid(row=row, column=1, sticky=W + E, **pad)
+
+        form.columnconfigure(1, weight=1)
+
+        add_row("Ce vinzi (categorie) *", ttk.Entry(form, textvariable=self.var_category), 0)
+        add_row("Brand (optional)", ttk.Entry(form, textvariable=self.var_brand), 1)
+        add_row("Culoare (optional)", ttk.Entry(form, textvariable=self.var_color), 2)
+        add_row("Marime (optional)", ttk.Entry(form, textvariable=self.var_size), 3)
+        add_row("Material (optional)", ttk.Entry(form, textvariable=self.var_material), 4)
+        add_row("Stare", ttk.Combobox(form, textvariable=self.var_condition, values=CONDITIONS, state="readonly"), 5)
+        add_row("Gen (optional)", ttk.Combobox(form, textvariable=self.var_gender, values=GENDERS), 6)
+
+        self.btn_analyze = ttk.Button(frame, text="Analizeaza piata Vinted & genereaza titlu/descriere",
+                                       command=self._on_analyze_clicked)
+        self.btn_analyze.pack(pady=8)
+
+        self.status_label = ttk.Label(frame, text="", foreground="#555")
+        self.status_label.pack()
+
+        results_frame = ttk.LabelFrame(frame, text="Rezultat")
+        results_frame.pack(fill=BOTH, expand=True, padx=8, pady=8)
+
+        ttk.Label(results_frame, text="Titlu generat:").pack(anchor=W, padx=6, pady=(6, 0))
+        self.title_text = Text(results_frame, height=2, wrap="word")
+        self.title_text.pack(fill=X, padx=6, pady=2)
+
+        ttk.Label(results_frame, text="Descriere generata:").pack(anchor=W, padx=6, pady=(6, 0))
+        self.desc_text = Text(results_frame, height=10, wrap="word")
+        self.desc_text.pack(fill=BOTH, expand=True, padx=6, pady=2)
+
+        self.price_label = ttk.Label(results_frame, text="Pret sugerat: -")
+        self.price_label.pack(anchor=W, padx=6, pady=(2, 6))
+
+    def _on_analyze_clicked(self):
+        category = self.var_category.get().strip()
+        if not category:
+            messagebox.showwarning("Lipseste categoria", "Scrie mai intai ce vinzi (ex: 'geaca de piele barbati').")
+            return
+
+        self.btn_analyze.config(state=DISABLED)
+        self.status_label.config(text="Se cauta pe Vinted si se analizeaza tendintele... (poate dura 5-15 secunde)")
+
+        thread = threading.Thread(target=self._run_analysis, args=(category,), daemon=True)
+        thread.start()
+
+    def _run_analysis(self, category: str):
+        try:
+            trends = get_market_trends(category, per_page=40, max_pages=2)
+        except Exception as e:
+            self.root.after(0, self._on_analysis_error, e)
+            return
+
+        item = ItemInfo(
+            category=category,
+            brand=self.var_brand.get().strip() or None,
+            color=self.var_color.get().strip() or None,
+            size=self.var_size.get().strip() or None,
+            material=self.var_material.get().strip() or None,
+            condition=self.var_condition.get(),
+            gender=self.var_gender.get().strip() or None,
         )
-        if response.status_code == 200:
-            return Image.open(io.BytesIO(response.content)).convert("RGBA")
-    
-    # Metodă de rezervă cloud AI gratuită
-    try:
-        response = requests.post(
-            "https://api.remove.bg/v1.0/removebg",
-            files={"image_file": image_bytes},
-            data={"size": "auto"},
-            headers={"X-Api-Key": api_key if api_key else ""},
-            timeout=15
+        listing = generate_listing(item, trends)
+        self.root.after(0, self._on_analysis_done, trends, listing)
+
+    def _on_analysis_done(self, trends: TrendReport, listing: dict):
+        self.last_trends = trends
+        self.btn_analyze.config(state=NORMAL)
+
+        if trends.sample_size == 0:
+            self.status_label.config(
+                text="Nu am gasit anunturi (posibil Vinted a blocat cererea automata sau categoria e prea specifica). "
+                     "Titlul/descrierea de mai jos sunt generate doar din datele introduse de tine."
+            )
+        else:
+            self.status_label.config(
+                text=f"Am analizat {trends.sample_size} anunturi similare. "
+                     f"Pret mediu pe piata: {trends.avg_price:.0f} RON."
+            )
+
+        self.title_text.delete("1.0", END)
+        self.title_text.insert("1.0", listing["title"])
+
+        self.desc_text.delete("1.0", END)
+        self.desc_text.insert("1.0", listing["description"])
+
+        price_text = f"{listing['suggested_price']:.0f} RON" if listing["suggested_price"] else "-"
+        self.price_label.config(text=f"Pret sugerat: {price_text}")
+
+    def _on_analysis_error(self, error: Exception):
+        self.btn_analyze.config(state=NORMAL)
+        self.status_label.config(text="Eroare la conectarea cu Vinted (vezi detalii).")
+        messagebox.showerror(
+            "Eroare",
+            f"Nu am putut analiza piata Vinted:\n{error}\n\n"
+            "Cauze posibile: Vinted a blocat cererea automata, sau nu exista conexiune la internet.\n"
+            "Poti totusi continua - titlul/descrierea se genereaza si fara date de piata."
         )
-        if response.status_code == 200:
-            return Image.open(io.BytesIO(response.content)).convert("RGBA")
-    except Exception:
-        pass
-    
-    return None
+        print(traceback.format_exc())
 
-def compose_catalog_image(cutout_img, bg_color_hex="#FFFFFF"):
-    """
-    Centrează haina decupată, adaugă umbră naturală de contact și fundal de catalog curat.
-    """
-    # Îndepărtare margini goale (auto-crop)
-    bbox = cutout_img.getbbox()
-    if bbox:
-        cutout_img = cutout_img.crop(bbox)
-        
-    # Dimensiune standard de catalog Vinted (raport 3:4)
-    canvas_w, canvas_h = 1080, 1440
-    
-    # Convertire culoare fundal
-    bg_hex = bg_color_hex.lstrip('#')
-    bg_rgb = tuple(int(bg_hex[i:i+2], 16) for i in (0, 2, 4))
-    canvas = Image.new("RGBA", (canvas_w, canvas_h), (*bg_rgb, 255))
-    
-    # Redimensionare proporțională (ocupă 80% din înălțimea sau lățimea imaginii)
-    target_max_w = int(canvas_w * 0.80)
-    target_max_h = int(canvas_h * 0.80)
-    cutout_img.thumbnail((target_max_w, target_max_h), Image.Resampling.LANCZOS)
-    
-    # Calcul coordonate centrare perfectă
-    pos_x = (canvas_w - cutout_img.width) // 2
-    pos_y = (canvas_h - cutout_img.height) // 2
-    
-    # Creare umbră discretă și realistă sub haină
-    shadow_mask = cutout_img.split()[3].filter(ImageFilter.GaussianBlur(15))
-    shadow = Image.new("RGBA", cutout_img.size, (0, 0, 0, 45))
-    canvas.paste(shadow, (pos_x + 4, pos_y + 12), shadow_mask)
-    
-    # Suprapunere haină
-    canvas.paste(cutout_img, (pos_x, pos_y), cutout_img)
-    
-    final_rgb = canvas.convert("RGB")
-    # Accentuează ușor culorile și textura ca să arate proaspăt spălat și călcat
-    final_rgb = ImageEnhance.Sharpness(final_rgb).enhance(1.2)
-    final_rgb = ImageEnhance.Contrast(final_rgb).enhance(1.05)
-    return final_rgb
+    # ------------------------------------------------------------------
+    # TAB 2: Procesare poze in stil studio
+    # ------------------------------------------------------------------
+    def _build_photos_tab(self):
+        frame = self.tab_photos
+        pad = {"padx": 8, "pady": 6}
 
-# --- DATE REALE VINTED & ANUNȚ ---
-def fetch_live_vinted(query):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
-    url = f"https://www.vinted.ro/api/v2/catalog/items?search_text={requests.utils.quote(query)}&order=relevance"
-    try:
-        r = requests.get(url, headers=headers, timeout=6)
-        if r.status_code == 200:
-            items = r.json().get("items", [])
-            if items:
-                sorted_items = sorted(items, key=lambda x: x.get("favourite_count", 0), reverse=True)[:6]
-                titles = [it.get("title", "") for it in sorted_items if it.get("title")]
-                avg_favs = sum([it.get("favourite_count", 0) for it in sorted_items]) / len(sorted_items)
-                
-                words = []
-                for t in titles:
-                    w_list = re.findall(r'\b[a-zA-Z0-9]{3,}\b', t.lower())
-                    words.extend([w for w in w_list if w not in ["the", "and", "de", "cu", "marimea", "nou", "stare"]])
-                return {"titles": titles, "avg_favs": round(avg_favs, 1), "kws": [x[0] for x in Counter(words).most_common(5)]}
-    except Exception:
-        pass
-    return None
+        top = ttk.Frame(frame)
+        top.pack(fill=X, **pad)
 
-# --- INTERFAȚA ---
-tab_photo, tab_listing = st.tabs(["📸 AI Photo Studio Pro", "⚡ Anunț & Căutare în Timp Real"])
+        ttk.Button(top, text="Alege poze...", command=self._choose_photos).pack(side=LEFT)
+        self.photos_label = ttk.Label(top, text="Nicio poza selectata.")
+        self.photos_label.pack(side=LEFT, padx=10)
 
-with tab_photo:
-    st.subheader("Transformă poza de pe telefon într-una de catalog")
-    
-    with st.expander("🔑 Opțional: Cheie API gratuită ClipDrop (pentru calitate maximă fără limite)"):
-        st.write("Dacă vrei decupare la nivel de fir de ață, fă un cont gratuit pe [clipdrop.co/apis](https://clipdrop.co/apis) și lipește cheia API aici:")
-        api_key_input = st.text_input("ClipDrop API Key (lasă liber pentru decuparea standard)", type="password")
-    
-    col_u, col_p = st.columns([1, 1], gap="medium")
-    with col_u:
-        photo_file = st.file_uploader("Încarcă poza hainei", type=["jpg", "jpeg", "png"])
-        bg_color = st.color_picker("Alege culoarea fundalului de studio", "#FFFFFF")
-        
-    with col_p:
-        if photo_file:
-            if st.button("🚀 Curăță și centrează haina cu AI", use_container_width=True):
-                with st.spinner("AI-ul decupează haina, elimină umbrele și o centrează..."):
-                    img_bytes = photo_file.getvalue()
-                    cutout = remove_bg_with_ai(img_bytes, api_key_input)
-                    
-                    if cutout:
-                        final_result = compose_catalog_image(cutout, bg_color)
-                        st.image(final_result, caption="Rezultat studio catalog", use_container_width=True)
-                        
-                        buf = io.BytesIO()
-                        final_result.save(buf, format="JPEG", quality=95)
-                        st.download_button("⬇️ Descarcă poza pentru Vinted", buf.getvalue(), "vinted_pro.jpg", "image/jpeg", use_container_width=True)
-                    else:
-                        st.warning("Pentru decupare de înaltă rezoluție prin server, adaugă o cheie gratuită ClipDrop mai sus (se generează gratuit în 30 de secunde pe site-ul lor).")
+        options = ttk.Frame(frame)
+        options.pack(fill=X, **pad)
+        ttk.Label(options, text="Fundal:").pack(side=LEFT)
+        self.bg_choice = StringVar(value="alb")
+        ttk.Combobox(
+            options, textvariable=self.bg_choice, values=["alb", "gri clar"],
+            state="readonly", width=12
+        ).pack(side=LEFT, padx=6)
 
-with tab_listing:
-    c1, c2 = st.columns([1, 1], gap="medium")
-    with c1:
-        brand = st.text_input("Brand", "Nike")
-        item_type = st.text_input("Tip articol", "Hanorac")
-        size = st.text_input("Mărime", "L")
-        condition = st.selectbox("Stare", ["Nou cu etichetă", "Foarte bună", "Bună", "Satisfăcătoare"])
-        measurements = st.text_area("Măsurători", "Lățime piept: 56 cm\nLungime: 70 cm")
-        style = st.selectbox("Stil / Trend", ["Vintage 90s", "Blokecore", "Streetwear", "Minimalist"])
-        scan_btn = st.button("🔍 Caută anunțuri de succes & Generează text", use_container_width=True)
-        
-    with c2:
-        if scan_btn:
-            q = f"{brand} {item_type}".strip()
-            with st.spinner(f"Analizez anunțurile populare pentru '{q}'..."):
-                data = fetch_live_vinted(q)
-                
-            month = datetime.now().month
-            season_tag = "#autumnvibes #layeringseason" if month in [9, 10, 11] else "#winterdrop" if month in [12, 1, 2] else "#springfit" if month in [3, 4, 5] else "#summerfit"
-            
-            extra_tags = " ".join([f"#{k}" for k in data["kws"]]) if data and data.get("kws") else ""
-            if data:
-                st.success(f"Analiză completă! Postările de top au o medie de **{data['avg_favs']} favorite**.")
-            
-            title_gen = f"{brand} {item_type} - {size} | {style}"
-            desc_gen = f"""Piesă selectată: {item_type} {brand}, în condiție excelentă.
+        self.btn_process = ttk.Button(frame, text="Transforma pozele in stil studio",
+                                       command=self._on_process_clicked)
+        self.btn_process.pack(pady=8)
 
-📏 Mărime pe etichetă: {size}
-✨ Stare: {condition}
-📐 Măsurători exacte:
-{measurements}
+        self.process_status = ttk.Label(frame, text="", foreground="#555")
+        self.process_status.pack()
 
-💡 Produs autentic, curat și bine întreținut.
-📦 Trimit prompt prin Vinted, ambalat cu atenție!
-💬 Răspund rapid la orice întrebare sau solicitare de bundle.
+        info = (
+            "Notă: se corectează automat luminozitatea/contrastul, se elimină fundalul, "
+            "se îndreaptă și centrează articolul pe un fundal neutru.\n"
+            "Repoziționarea completă a hainei (ex: transformare din 'pusă pe pat' în 'pe manechin') "
+            "necesită AI generativ și nu este inclusă în acest pas automat."
+        )
+        ttk.Label(frame, text=info, wraplength=820, foreground="#777", justify=LEFT).pack(padx=8, pady=10)
 
-#{brand.lower().replace(' ', '')} #{style.lower().replace(' ', '')} {season_tag} {extra_tags}"""
+    def _choose_photos(self):
+        paths = filedialog.askopenfilenames(
+            title="Alege poze",
+            filetypes=[("Imagini", "*.jpg *.jpeg *.png *.webp")]
+        )
+        if paths:
+            self.selected_photos = list(paths)
+            self.photos_label.config(text=f"{len(paths)} poza(e) selectata(e).")
 
-            st.markdown("#### Titlu:")
-            st.code(title_gen, language="text")
-            st.markdown("#### Descriere dinamică:")
-            st.code(desc_gen, language="text")
+    def _on_process_clicked(self):
+        if not self.selected_photos:
+            messagebox.showwarning("Nicio poza", "Alege mai intai una sau mai multe poze.")
+            return
+
+        self.btn_process.config(state=DISABLED)
+        self.process_status.config(text="Se proceseaza pozele...")
+
+        thread = threading.Thread(target=self._run_processing, daemon=True)
+        thread.start()
+
+    def _run_processing(self):
+        bg_color = (255, 255, 255) if self.bg_choice.get() == "alb" else (235, 235, 235)
+        out_dir = Path.home() / "Desktop" / "poze_studio_vinted"
+        if not out_dir.parent.exists():
+            out_dir = Path.cwd() / "poze_studio_vinted"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        results = []
+        errors = []
+        for path in self.selected_photos:
+            try:
+                name = Path(path).stem
+                out_path = out_dir / f"{name}_studio.jpg"
+                enhance_photo(path, str(out_path), bg_color=bg_color)
+                results.append(str(out_path))
+            except Exception as e:
+                errors.append((path, str(e)))
+
+        self.root.after(0, self._on_processing_done, results, errors, out_dir)
+
+    def _on_processing_done(self, results, errors, out_dir):
+        self.btn_process.config(state=NORMAL)
+        msg = f"Am salvat {len(results)} poza(e) in:\n{out_dir}"
+        if errors:
+            msg += f"\n\n{len(errors)} poza(e) au dat eroare:\n"
+            msg += "\n".join(f"- {Path(p).name}: {e}" for p, e in errors)
+        self.process_status.config(text=f"Terminat. {len(results)} poza(e) salvata(e) in {out_dir}")
+        messagebox.showinfo("Terminat", msg)
+
+
+def main():
+    root = Tk()
+    app = VintedAssistantApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
